@@ -1,6 +1,6 @@
 # MongoDB Pessimistic Locking System
 
-<a href="https://github.com/ronita-kuriakose-mongodb/pessimistic-lock/actions"><img src="https://github.com/ronita-kuriakose-mongodb/pessimistic-lock/actions/workflows/maven.yml/badge.svg" alt="CI"></a>
+<a href="https://github.com/iuliangoriac/mongo-lock/actions"><img src="https://github.com/iuliangoriac/mongo-lock/actions/workflows/maven.yml/badge.svg" alt="CI"></a>
 
 This project implements a distributed pessimistic locking system using MongoDB as the backend. It is designed to handle
 lock acquisition, renewal, and release in a distributed environment, ensuring robust concurrency control. The system is
