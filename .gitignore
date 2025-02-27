@@ -34,7 +34,3 @@ build/
 
 ### VS Code ###
 .vscode/
-
-### MF Plugin ###
-*.subst
-*.answer.md

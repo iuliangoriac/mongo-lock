@@ -1,516 +1,234 @@
-# MongoDB Pessimistic Locking System
-
-<a href="https://github.com/iuliangoriac/mongo-lock/actions"><img src="https://github.com/iuliangoriac/mongo-lock/actions/workflows/maven.yml/badge.svg" alt="CI"></a>
-
-This project implements a distributed pessimistic locking system using MongoDB as the backend. It is designed to handle
-lock acquisition, renewal, and release in a distributed environment, ensuring robust concurrency control. The system is
-particularly suitable for scenarios requiring strong consistency and resource coordination across distributed nodes.
-
-## Table of Contents
-<!-- TOC -->
-* [MongoDB Pessimistic Locking System](#mongodb-pessimistic-locking-system)
-  * [Overview](#overview)
-  * [Key Features](#key-features)
-  * [Architecture & Design](#architecture--design)
-  * [How It Works](#how-it-works)
-  * [Usage](#usage)
-  * [Example: Distributed Order Processing System](#example-distributed-order-processing-system)
-  * [Multiple thread interaction diagram](#multiple-thread-interaction-diagram)
-  * [Configuration](#configuration)
-  * [Conclusion](#conclusion)
-<!-- TOC -->
-
----
-
-## Overview
-
-`MongoLockManager` provides a robust distributed locking mechanism using MongoDB. The system supports pessimistic
-locking and offers **Managed Locks**. It ensures thread-safe and distributed lock management with features like
-automatic lock expiration, exponential backoff for retries, and a heartbeat mechanism for extending lock lifetimes.
-
-### Key Components:
-
-- **The Lock Collection**: A dedicated MongoDB collection that stores lock metadata (e.g., lock ID, expiration time,
-  lock owner ID, lock specific TTL interval).
-- **Exponential Backoff**: A strategy used to reduce contention during lock acquisition retries.
-- **Heartbeat Mechanism**: A singleton thread (pe JVM) that manages the lifecycle of the locks: automatic lock TTL
-  extension and cleanup.
-- **Flexible API**: Similar
-  to [java.util.concurrent.locks.Lock](https://docs.oracle.com/javase/8/docs/api/java/util/concurrent/locks/Lock.html)
-  interface.
-
-### Why MongoDB backed Pessimistic Locking:
-
-An unjustly brief introduction will start with ACID transactions:
-
-- **A**_tomicity_ - Transactions are all-or-nothing; fully complete or fully rollback.
-- **C**_onsistency_ - Transactions maintain database validity, adhering to predefined rules and constraints.
-- **I**_solation_ - Concurrent transactions execute independently without interfering with each other.
-- **D**_urability_ - Committed transactions are permanently saved, even after system failures.
-
-Isolation levels in database systems are mechanisms to control the visibility of data changes between transactions,
-ensuring data consistency and integrity.
-These levels are implemented using **pessimistic locking** or **optimistic locking**, depending on the approach chosen
-by the database or application.
-
-###### **Key Differences**
-
-| **Aspect**             | **Pessimistic Locking**                                                                                                            | **Optimistic Locking**                                                                |
-|------------------------|------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------|
-| **Conflict Handling**  | Proactively prevents conflicts by locking resources.                                                                               | Detects conflicts at commit time.                                                     |
-| **Retry Logic**        | Rarely required as conflicts are prevented upfront.                                                                                | Required to handle conflicts when detected.                                           |
-| **Concurrency**        | When ensuring data integrity is more important than maximizing concurrency.                                                        | When maximizing concurrency is a priority, and conflicts are rare.                    |
-| **Data Sensitivity**   | Critical when data integrity is paramount, such as financial transactions.                                                         | Appropriate for non-critical updates where occasional retries are acceptable.         |
-| **Performance Impact** | Suitable for environments where locking overhead is acceptable due to fewer users.                                                 | Suitable for high-read, low-write environments where locking is avoided.              |
-| **Implementation**     | Typically involves database-level locks (e.g., row-level or table-level locks).                                                    | Often implemented using versioning (e.g., timestamps or version numbers).             |
-| **Risk of Deadlocks**  | Higher risk of deadlocks due to locking resources for extended periods.                                                            | No risk of deadlocks as no locks are held.                                            |
-| **Use Case**           | Scenarios with high contention or frequent concurrent updates to the same data.                                                    | Scenarios with low contention or infrequent concurrent updates to the same data.      |
-| **Example Use Cases**  | - Bank account transfers<br>- Inventory management with high contention<br>- Reservation systems where overbooking is unacceptable | - User profile updates<br>- Shopping cart updates<br>- Collaborative document editing |
-
-MongoDB does not natively support **pessimistic locking** (like traditional relational databases using
-`SELECT ... FOR UPDATE`).
-MongoDB's design philosophy emphasizes high availability, scalability, and performance, which aligns more with
-**optimistic concurrency control** through mechanisms like versioning (`$inc`, `$set`, `$currentDate`, etc.) or the
-`findAndModify` operation.
-More details in [MongoDB - FAQ: Concurrency](https://www.mongodb.com/docs/manual/faq/concurrency/#faq--concurrency).
-
-However, to implement pessimistic locking in MongoDB, it can simulated by using the following approaches (the list is
-not exhaustive):
-
-1. **Use a "Lock" Field in Documents**
-    - **Pros**: Simple and works for many use cases.
-    - **Cons**: Requires careful handling of lock expiration to avoid deadlocks.
-2. **Use a Separate Lock Collection**
-    - **Pros**: Cleaner separation of locking logic.
-    - **Cons**: Requires an additional collection and careful cleanup of expired locks.
-3. **Use a distributed locking library like _Redlock_ or implement a similar pattern with MongoDB**
-    - **Pros**: A robust and reusable distributed locking mechanism that ensures consistency across multiple nodes.
-    - **Cons**: Introduces additional setup complexity and potential performance overhead due to cross-node
-      coordination.
-
-The solution presented here is offered as a (criticizable) reference implementation of the second approach mentioned
-above
-and also as a serious consideration for the last one.
-
----
-
-## Key Features
-
-- **Distributed Locking**: Locks are stored in a MongoDB collection, making them accessible across distributed systems.
-- **Thread Safety**: Locks are designed to be thread-safe, ensuring safe concurrent access in multithreaded
-- **Customizable Lock Behavior**: Configurable TTL, heartbeat intervals, and retry strategies.
-- **Exponential Backoff with Jitter**: Retry strategies for lock acquisition to reduce contention.
-- **TTL-based Expiration**: Locks have a time-to-live (TTL) to prevent deadlocks caused by abandoned locks.
-- **Reentrant Locking**: Allows the same thread to re-acquire a lock it already owns.
-- **Heartbeat Mechanism**: Active locks are periodically renewed to maintain their validity. Locks owned by terminated
-  threads are automatically released
-
----
-
-## Architecture & Design
-
-The system is composed of the following components:
-
-### 1. **MongoLock**
-
-- An interface defining the core locking operations: `lockInterruptibly`, `tryLock`, and `unlock`.
-- Locks are stored as documents in a MongoDB collection and MongoDB properties ensures mutual exclusion in distributed
-  environments
-
-### 2. **MongoLockImpl**
-
-- Implements the `MongoLock` interface.
-- Manages individual lock instances, including metadata such as owner ID, TTL, and thread ownership.
-- Handles lock acquisition, renewal, and release.
-
-### 3. **MongoLockManager**
-
-- Central manager for creating and maintaining locks.
-- Provides singleton instances per MongoDB connection and collection.
-- Manages the heartbeat mechanism for periodic lock renewal and cleanup.
-- Releases locks owned by threads that are no longer alive.
-- Periodic cleanup of expired locks to prevent stale entries in the database.
-- Implements thread-safe operations using synchronized sets and atomic references.
-
-### 4. **TemporalAlignmentStrategy**
-
-- Defines strategies for managing TTL, heartbeat intervals, and retry delays.
-- Implements exponential backoff with jitter for lock acquisition retries.
-- Exponential backoff prevents excessive contention by introducing delays between retries.
-- Jitter is added to avoid synchronized retries across threads.
-
-### 5. **MongoLockUtils**
-
-- Utility class for shared functionality, such as handling MongoDB write exceptions and managing heartbeats.
-- Heartbeat is implemented via pooled ScheduledExecutorService.
-
-### 6. **HeartbeatUncaughtExceptionHandler**
-
-- Ensures the heartbeat thread continues running even if unexpected exceptions occur.
-
-### 7. **ThreadUncaughtExceptionHandler**
-
-- Releases locks held by threads that terminate unexpectedly due to uncaught exceptions.
-
-### 8. **MongoLockWrappingException**
-
-- A custom runtime exception for encapsulating low-level MongoDB exceptions in lock operations.
-
-### 9. **MongoRepository**
-
-- Encapsulates all communication with MongoDB server.
-
-
-### Component Interaction
-
-```mermaid
-classDiagram
-    class MongoLock {
-        +lockInterruptibly()
-        +tryLock(value: long, unit: TimeUnit)
-        +tryLock(): boolean
-        +unlock()
-    }
-
-    class MongoLockManager {
-        +$getInstance(...)
-        +createLock(lockId: String): MongoLock
-        +createLock(lockId: String, value: long, unit: TimeUnit)
-    }
-
-    class TemporalAlignmentStrategy {
-        +getBufferedLockTtlMillis(ttlMillis: long): long
-        +calculateDelay(attemptNo: int): long
-    }
-
-    MongoLock <|-- MongoLockImpl
-    MongoLockImpl --> MongoRepository
-    MongoLockImpl --> HeartbeatUncaughtExceptionHandler
-    MongoLockImpl --> ThreadUncaughtExceptionHandler
-    MongoLockManager --> MongoRepository
-    MongoLockManager --> MongoLockImpl
-    MongoLockManager --> TemporalAlignmentStrategy
-    MongoLockManager --> MongoLockUtils
-    MongoLockUtils --> MongoLockWrappingException
-    MongoLockUtils --> HeartbeatUncaughtExceptionHandler
-```
-
----
-
-## How It Works
-
-### Lock Lifecycle
-
-1. **Creation**: A lock is created using `MongoLockManager.createLock()`.
-2. **Acquisition**: The lock is acquired using `lockInterruptibly()` or `tryLock()`.
-   If the lock is unavailable, retries are managed with exponential backoff and jitter.
-3. **Renewal**: The heartbeat mechanism periodically extends the TTL of active locks.
-4. **Release**: Locks are explicitly released using `unlock()` or automatically cleaned up if expired or orphaned.
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant MongoLockManager
-    participant MongoLock
-    participant MongoDB
-    MongoLockManager ->> MongoDB: Ensure collection and indexes
-    Client ->> MongoLockManager: createLock("lockId")
-    MongoLockManager ->> MongoLock: Create new lock instance
-    MongoLockManager -->> Client: Return lock instance
-    loop On the heartbeat thread
-        MongoLockManager ->> MongoDB: onBeat()
-        note right of MongoLockManager: lock management tasks
-    end
-    Client ->> MongoLock: tryLock()
-    MongoLock ->> MongoDB: Insert or update lock document
-    MongoLock -->> Client: Lock acquired
-    Client ->> MongoLock: unlock()
-    MongoLock ->> MongoDB: Delete lock document
-    MongoLock -->> Client: Lock released
-```
-
-### Heartbeat Mechanism
-
-- A scheduled task runs periodically to:
-    - Extend the TTL of active locks.
-    - Clean up expired locks.
-    - Release locks held by terminated threads.
-    - Synchronize the server-client time delta for accurate TTL calculations.
-
----
-
-## Usage
-
-1. **MongoDB Connection**:
-   Ensure a MongoDB instance is running and accessible.
-   ```java
-   MongoClient mongoClient = MongoClients.create("mongodb://localhost:27017");
-   MongoLockManager lockManager = MongoLockManager.getInstance(mongoClient);
-   ```
-
-2. **Creating a Lock with the default TTL**:
-   ```java
-   MongoLock lock = lockManager.createLock("myLock");
-   ```
-
-3. **Creating a Lock with a user-defined TTL**:
-   ```java
-   MongoLock lock = lockManager.createLock("myLock", 15, TimeUnit.SECONDS);
-   ```
-
-4. **Acquiring a Lock**:
-   ```java
-   try {
-       lock.lockInterruptibly(); // Blocks until the lock is acquired
-       // Perform critical section
-   } catch (InterruptedException e) {
-       Thread.currentThread().interrupt();
-   } finally {
-       lock.unlock();
-   }
-   ```
-   or
-   ```java
-   try {
-       // Blocks until the lock is acquired but no more than 10 seconds
-       if (lock.tryLock(10, TimeUnit.SECONDS)) { 
-           // Perform critical section
-       } 
-   } catch (InterruptedException e) {
-       Thread.currentThread().interrupt();
-   } finally {
-       lock.unlock();
-   }
-   ```
-   or
-   ```java
-   try {
-       if (lock.tryLock()) { // No block: fails or succeeds instantly
-           // Perform critical section
-       }
-   } finally {
-       lock.unlock();
-   } 
-   ```
-
-5. **Releasing a Lock**:
-   ```java
-   lock.unlock();
-   ```
----
-
-## Example: Distributed Order Processing System
-
-#### Problem:
-
-Imagine an e-commerce platform where multiple services process customer orders concurrently. Each order must be
-processed exactly once to avoid issues like double charging or duplicate shipments. Since these services are distributed
-across multiple servers, a mechanism is needed to ensure that only one service processes a specific order at a time.
-
-#### Solution:
-
-Use the `MongoLockManager` to implement distributed locking. Each service attempts to acquire a lock on the order ID
-before processing it. The heartbeat mechanism ensures that locks are not prematurely released during long-running
-operations, even under high load or network delays.
-
----
-
-### How to Use the Implementation
-
-#### Step 1: Initialize the MongoDB Lock Manager
-
-First, set up a MongoDB instance and connect to it using the `MongoLockManager`. The lock manager will use a MongoDB
-collection to store lock metadata.
+# MongoDB Distributed Pessimistic Locks for Java
+
+This article explores a reference implementation of a pessimistic locking mechanism backed by MongoDB,
+tailored for distributed systems.
+We will examine how this solution addresses key concerns such as
+mutual exclusion, lock expiration, fault tolerance, and scalability,
+providing a practical guide for developers seeking to integrate distributed locking into their applications.
+
+
+## Why Pessimistic Locking?
+
+Data integrity is the bedrock of any reliable application.
+Starting with version 4.0, MongoDB introduced
+[multi-document ACID transactions](https://www.mongodb.com/products/capabilities/transactions).
+By default, MongoDB employs optimistic concurrency control to ensure isolation,
+allowing transactions to operate on a snapshot of the data.
+Changes are validated, and conflicts are detected at commit time.
+While this approach scales well in scenarios with infrequent write conflicts,
+high-contention environments with costly rollbacks and critical consistency requirements
+may benefit from a more proactive approach,
+such as custom-defined pessimistic locking mechanisms.
+To address such needs,
+we provide a reference Java (21+) implementation that not only secures multi-document transactions
+but also serves as a versatile distributed locking solution backed by MongoDB.
+
+
+## Basic Usage Example
+
+The following example demonstrates how to use `MongoLock` to safeguard a critical section of code
+against the classic Read-Update-Modify anti-pattern:
 
 ```java
-import com.mongodb.client.MongoClients;
-import com.mongodb.pessimistic.heartbeat.MongoLockManager;
+// Initialize the MongoClient (MongoDB Java driver API)
+MongoClient mongoClient = MongoClients.create("mongodb://localhost:27017");
 
-public class LockManagerSetup {
-    public static MongoLockManager initializeLockManager() {
-        var mongoClient = MongoClients.create("mongodb://localhost:27017");
-        return MongoLockManager.getInstance(mongoClient);
+// Get a MongoLockManager instance
+MongoLockManager lockManager = MongoLockManager.getInstance(mongoClient);
+
+// Create a lock with a 4-second TTL
+MongoLock lock = lockManager.createLock("L1", 4, TimeUnit.SECONDS);
+
+try {
+    // Attempt to acquire the lock, waiting up to 12 seconds
+    if (lock.tryLock(12, TimeUnit.SECONDS)) { 
+        
+        // Access the target collection
+        var collection = mongoClient.getDatabase("test").getCollection("collection");
+        
+        // Perform the Read-Update-Modify sequence safely
+        var document = collection.find(eq("_id", id)).first();
+        var nextCount = document.getInteger("counter") + 1;
+        collection.updateOne(eq("_id", id), 
+                   new Document("$set", new Document("counter", nextCount)));
     }
+} catch (InterruptedException e) {
+    Thread.currentThread().interrupt(); // Handle thread interruption
+} finally {
+    // Ensure the lock is released (idempotent operation)
+    lock.unlock();
 }
 ```
+The `MongoLock` API adopts the familiar semantics of the `java.util.concurrent.locks.Lock` interface,
+making it intuitive to use while abstracting away the underlying complexity of distributed locking.
 
----
 
-#### Step 2: Acquire a Lock Before Processing an Order
+## Implementation Details
 
-Each service attempts to acquire a lock on the order ID before processing it. If the lock is successfully acquired, the
-service proceeds with processing; otherwise, it retries with exponential backoff.
 
-```java
-import com.mongodb.pessimistic.heartbeat.MongoLock;
-import com.mongodb.pessimistic.heartbeat.MongoLockManager;
+### Lock attributes persistence
 
-import java.util.concurrent.TimeUnit;
+To ensure that the business logic collections remain isolated and unaffected,
+the `MongoLock` mechanism operates on a dedicated collection (`pessimisticLocks`)
+within a separate database (`MongoLocks`).
 
-public class OrderProcessor {
-    private final MongoLockManager lockManager;
-
-    public OrderProcessor(MongoLockManager lockManager) {
-        this.lockManager = lockManager;
-    }
-
-    public void processOrder(String orderId) {
-        MongoLock lock = lockManager.createLock(orderId, 10, TimeUnit.SECONDS); // Lock TTL: 10 seconds
-
-        try {
-            if (lock.tryLock(5, TimeUnit.SECONDS)) { // Try acquiring the lock within 5 seconds
-                LOGGER.info("Lock acquired for order: " + orderId);
-                // order processing
-                Thread.sleep(2000); // Processing takes 2 seconds
-                LOGGER.info("Order processed: " + orderId);
-            } else {
-                LOGGER.error("Failed to acquire lock for order: " + orderId);
-            }
-        } catch (InterruptedException e) {
-            LOGGER.error("Lock acquisition interrupted for order: " + orderId);
-        } finally {
-            lock.unlock(); // Release the lock
-            LOGGER.error("Lock released for order: " + orderId);
-        }
-    }
-}
-```
-
----
-
-## Multiple thread interaction diagram
-
-```mermaid
-sequenceDiagram
-    participant Thread1
-    participant Thread2
-    participant LockManager
-    participant MongoDB
-    participant ThreadUncaughtExceptionHandler
-%% Thread 1 starts and tries to acquire the lock
-    Thread1 ->> LockManager: Request lock
-    LockManager ->> MongoDB: Query and update lock document
-    MongoDB -->> LockManager: Lock acquired
-    LockManager -->> Thread1: Lock acquired successfully
-%% Thread 2 starts and tries to acquire the same lock
-    Thread2 ->> LockManager: Request lock
-    LockManager ->> MongoDB: Query lock document
-    MongoDB -->> LockManager: Lock already held by Thread1
-    LockManager -->> Thread2: Lock acquisition failed, backoff initiated
-%% Thread 2 enters backoff loop
-    loop Backoff Loop
-        Thread2 ->> LockManager: Retry lock acquisition
-        LockManager ->> MongoDB: Query lock document
-        MongoDB -->> LockManager: Lock still held
-        LockManager -->> Thread2: Retry failed, backoff continues
-    end
-
-%% Heartbeat mechanism to extend lock TTL
-    loop Heartbeat Loop
-        LockManager ->> MongoDB: Extend lock TTL for Thread1
-        MongoDB -->> LockManager: TTL extended
-    end
-
-%% Thread 1 finishes its work and releases the lock
-    Thread1 ->> LockManager: Unlock
-    LockManager ->> MongoDB: Delete lock document
-    MongoDB -->> LockManager: Lock released
-    LockManager -->> Thread1: Lock released successfully
-%% Thread 2 successfully acquires the lock after Thread 1 releases it
-    Thread2 ->> LockManager: Retry lock acquisition
-    LockManager ->> MongoDB: Query and update lock document
-    MongoDB -->> LockManager: Lock acquired
-    LockManager -->> Thread2: Lock acquired successfully
-%% Thread 2 fails unexpectedly
-    Thread2 ->> ThreadUncaughtExceptionHandler: Uncaught exception
-    ThreadUncaughtExceptionHandler ->> LockManager: Unlock lock on failure
-    LockManager ->> MongoDB: Delete lock document
-    MongoDB -->> LockManager: Lock released
-    ThreadUncaughtExceptionHandler -->> Thread2: Exception handled
-%% Final state
-    MongoDB -->> LockManager: Lock is free
-```
-
-### Key Highlights of the Diagram:
-
-1. **Multiple Threads Acquiring the Lock**:
-    - Thread1 acquires the lock successfully.
-    - Thread2 attempts to acquire the same lock but is denied as it's already held by Thread1.
-
-2. **Lock Release**:
-    - Thread1 releases the lock, allowing Thread2 to retry and acquire it successfully.
-
-3. **Thread Failure**:
-    - Thread2 encounters an exception during execution.
-    - The `ThreadUncaughtExceptionHandler` ensures the lock is released to prevent deadlocks.
-
-4. **Heartbeat Mechanism**:
-    - The `MongoLockManager` periodically extends the TTL of active locks to prevent expiration while the lock is still
-      in use.
-
-5. **Thread Completion**:
-    - Threads release the lock upon completing their work, ensuring proper cleanup in the MongoDB collection.
-
----
-
-## Configuration
-
-### Database Access Rights
-
-Considering that the locks collection namespace is `MongoLocks.pessimisticLocks`
-the minimal set of permissions required for this solution to work is:
-
-- **insert**      @ MongoLocks (*pessimisticLocks*)
-- **find**        @ MongoLocks (*pessimisticLocks*)
-- **update**      @ MongoLocks (*pessimisticLocks*)
-- **remove**      @ MongoLocks (*pessimisticLocks*)
-- **createIndex** @ MongoLocks (*pessimisticLocks*)
-
-In addition, in order to run the _tests_ the following set of rights will have to be granted to `MongoLocks.pessimisticLocks`<u>`Test`</u>:
-
-- **insert**         @ MongoLocks (*pessimisticLocksTest*)
-- **find**           @ MongoLocks (*pessimisticLocksTest*)
-- **update**         @ MongoLocks (*pessimisticLocksTest*)
-- **remove**         @ MongoLocks (*pessimisticLocksTest*)
-- **createIndex**    @ MongoLocks (*pessimisticLocksTest*)
-- **dropCollection** @ MongoLocks (*pessimisticLocksTest*)
-
-### Environment Variables
-- **`DEFAULT_LOCK_TTL_MILLIS`**: Overrides the default lock TTL (default: `5000ms`).
-- **Minimum TTL**: Enforced at `500ms` to ensure safety.
-
-### Temporal Strategy
-- Default heartbeat interval: `TTL / 3`.
-- Default exponential backoff: `Heartbeat Interval / 10`.
-
-### Test Configuration
-
-In order to run the tests an Atlas connection will be required.
-
-The Atlas configuration will have to be put in a `config.json` file on the local drive, having the following structure:
-
-```json
-{
-  "atlas": {
-    "uri": "mongodb+srv://.../?appName=AXP",
-    "userName": "admin",
-    "password": "..."
+**Lock Document Structure**: Each lock is represented as a document with the following schema:
+  ```json
+  {
+    "_id": "L1",   
+    "ownerId": "88968b03-a40e-4f9f-8727-e16523feedb7",
+    "ttlMs": 4400,
+    "expiresAt": 1740398945776  
   }
-}
-```
+  ```
 
-After this add an environment variable named `AXP_CONFIG_JSON_PATH` with the path to the config file
-`C:\Users\my.name\...\config.json`.
+**Field semantics**:
+- **`_id`**: Unique identifier for the lock (or the set of resources used in the critical sections).
+- **`ownerId`**: Identifies the unique pair (lock ID, owner thread)
+- **`ttlMs`**: The lock’s time-to-live, including a 10% buffer for clock drift.
+- **`expiresAt`**: The expiration timestamp, adjusted for server-client time differences.
+
+
+### The lock manager
+
+The `MongoLockManager` is responsible for managing lock persistence and
+ensuring proper configuration of the underlying MongoDB collection.
+It maintains an efficient, thread-safe Java collection of all active `MongoLock` instances.
+A singleton **heartbeat scheduler** periodically updates the expiration time of active locks,
+releases locks held by terminated threads, and cleans up expired lock documents.
+
+Key methods include:
+- **`updateServerTimeDelta()`**: Synchronizes the server-client time delta using
+  MongoDB’s `$$NOW` aggregation variable and Java’s `System.currentTimeMillis()`.
+- **`onBeat()`**: Implements the maintenance logic periodically called by the heartbeat.
+
+
+#### The heartbeat
+
+The heartbeat is a periodic background task that plays a vital role in maintaining the health and reliability
+of distributed locks.
+While the basic lock lifecycle ensures a minimal level of guarantees—such as leasing
+a lock for a fixed duration—it has limitations.
+For example, without additional safeguards,
+it can be difficult to determine if a lock owner is still active or has failed,
+or to dynamically adjust lock durations.
+
+This is where the heartbeat comes in. It enhances the locking mechanism by periodically performing the following tasks:
+
+- **Extending Active Locks**:
+  Automatically updates the expiration time of active locks to prevent them from expiring prematurely.
+  This is done in bulk for efficiency.
+- **Releasing Locks from Terminated Threads**:
+  Detects and releases locks held by threads that are no longer alive (using `.isAlive()`),
+  even before their `expiresAt` timestamp.
+- **Synchronizing Time**:
+  Updates the server-client time delta to account for clock drift between the application and MongoDB server.
+- **Cleaning Up Expired Locks**:
+  Removes expired lock documents from the MongoDB collection to keep the database clean and efficient.
+
+By performing these tasks, the heartbeat ensures that locks remain valid, stale locks are cleaned up,
+and the system can reliably detect and handle failures.
+This improves the overall robustness and performance of the distributed locking mechanism.
+
+
+### The lock lifecycle
+
+A `MongoLock` instance is created using `MongoLockManager.createLock(..)`,
+but the lock is not active until `tryLock()` is called.
+Lock acquisition and mutual exclusion are guaranteed by MongoDB’s atomic `insertOne` and `findOneAndUpdate`
+operations, which use the **majority** write concern and **primary** read preference
+to prevent deadlocks and split-brain scenarios.
+
+
+#### Lock Acquisition Behavior
+- If no lock document exists, a new document is created.
+- If the lock is already held by the current thread, the expiration time is extended.
+- If the lock is held by another thread and expired, ownership is transferred to the requesting thread.
+- Retry attempts use exponential backoff with jitter to prevent livelocks.
+
+Locks can be explicitly released using the `unlock()` method,
+ensuring proper cleanup after the critical section is executed.
+
+1. **Explicit Release**:
+   The lock is manually released using the `.unlock()` method,
+   ideally within a `finally` block to ensure proper cleanup.
+2. **Unhandled Exception Handling**:
+   If a thread terminates due to an unhandled exception,
+   the lock is released via a custom `Thread.UncaughtExceptionHandler` using the `.unlock()` method.
+3. **Heartbeat Monitoring**:
+   A dedicated heartbeat thread monitors all registered locks.
+   If the owner thread is no longer alive,
+   the heartbeat explicitly releases the locks before they expire using the `.unlock()` method.
+4. **Lock Reassignment**:
+   If a lock expires, it can be automatically reassigned to another worker using the `.tryLock(..)` method.
+5. **Database Cleanup**:
+   The heartbeat thread can also delete expired lock entries directly from the database to prevent stale locks.
+
+
+## Known limitations
+
+The heartbeat logic is safeguarded by a dedicated exception handler,
+but issues may arise if it stops or is starved.
+Key risks include:
+
+1. **Lock Expiration**:
+   Lock TTLs may not be extended.
+   This can be mitigated by using longer TTLs relative to the heartbeat interval
+   or manually extending locks via `.tryLock()`.
+2. **Time Delta Drift**:
+   The server-client time delta may become outdated,
+   which can be addressed by increasing the `lockTtlBufferCoefficient`.
+3. **Delayed Lock Release**:
+   While this may cause performance penalties,
+   deadlocks are avoided since stopped heartbeats halt automatic extensions,
+   allowing locks to be deleted or transferred during `.tryLock()`.
+
+If a JVM crashes, the primary concern is performance.
+
+Locks are reentrant, allowing repeated `.tryLock()` calls to extend TTLs.
+However, creating multiple locks for the same thread and lock ID can lead to deadlocks
+with `.lockInterruptibly()` or `.tryLock(0, ..)`.
+To prevent this, `MongoLockManager` could throw an exception when attempting to
+create multiple locks with the same ID for the same thread.
+
+No fairness mechanism is implemented, but an `ownerId` queue with tailable cursors could address this.
+
+
+## Advanced Configuration
+
+When creating a `MongoLockManager`,
+the API allows customization of the lock collection name and its associated database.
+
+Given the unique nature of distributed systems, temporal synchronization strategies must be adaptable.
+To address this, the `TemporalAlignmentStrategy` class encapsulates the configuration,
+leveraging the following parameters:
+
+- **`lockTtlMillis`**: Specifies the default time-to-live (TTL) for a lock in milliseconds.
+- **`lockTtlBufferCoefficient`**: A multiplier to account for potential clock drift across replica set nodes.
+- **`beatIntervalMillis`**: Defines the interval at which the `MongoLockManager.onBeat()` method is invoked.
+- **`baseBackoffMillis`**: Sets the minimum delay between lock acquisition retries.
+- **`maxJitter`**: Introduces a random jitter to the backoff delay, up to this maximum value.
+- **`maxDelay`**: Specifies the upper limit for retry delays in milliseconds.
+
+This design ensures flexibility and robustness,
+enabling fine-tuned synchronization strategies tailored to the requirements of diverse distributed environments.
+
 
 ## Conclusion
 
-The `MongoLockManager` provides a robust and flexible locking mechanism for distributed systems. By leveraging MongoDB's
-capabilities, it ensures reliable and efficient lock management. The system's support for both basic and managed locks
-makes it suitable for a wide range of use cases, from short-lived tasks to long-running operations.
+This reference implementation of a distributed pessimistic locking mechanism using MongoDB
+provides a robust solution for high-contention environments.
+By leveraging MongoDB’s atomic operations and a carefully designed heartbeat mechanism,
+the implementation ensures data integrity, fault tolerance, and scalability.
+While there are some limitations, such as the lack of fairness and potential heartbeat failures,
+these can be mitigated through configuration and additional enhancements.
 
-This implementation addresses common locking challenges, such as deadlocks, contention, and resource leaks, making it a
-valuable tool for developers building distributed applications.
+In the end we would like to thank all our colleagues who made this initiative possible
+and in particular to John Page and Carlos Castro for sharing their invaluable technical expertise.
 
 
-
-
+## References
+1. [How To SELECT ... FOR UPDATE inside MongoDB Transactions](https://www.mongodb.com/blog/post/how-to-select-for-update-inside-mongodb-transactions)
+2. [MongoDB FAQ: Concurrency](https://www.mongodb.com/docs/manual/faq/concurrency/)
+3. [Redis Lock](https://redis.io/glossary/redis-lock/)
+4. [GitHub Repository](https://github.com/ronita-kuriakose-mongodb/pessimistic-lock)
