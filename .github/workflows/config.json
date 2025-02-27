@@ -1,0 +1,7 @@
+{
+  "atlas": {
+    "uri": "mongodb://localhost:27017",
+    "userName": "testuser",
+    "password": "testpassword"
+  }
+}
